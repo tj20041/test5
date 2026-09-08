@@ -64,12 +64,31 @@ merged_stage = current_dim.join(
     "full_outer"
 )
 
+# Defensive post-join guard: ensure no unexpected duplicate column names exist
+# beyond the known emp_id duplicate introduced by the expression-style join
+duplicate_cols = [c for c in set(merged_stage.columns) if merged_stage.columns.count(c) > 1]
+if duplicate_cols != ["emp_id"]:
+    unexpected = [c for c in duplicate_cols if c != "emp_id"]
+    if unexpected:
+        raise ValueError(
+            f"Unexpected duplicate columns detected after join: {unexpected}. "
+            "Review source schema changes before proceeding."
+        )
+
 logger.info("Transforming SCD type 2 records and projecting schema...")
 
-# FAILS HERE: emp_id is present in both current_dim and updates_df
-# Spark cannot determine which table's emp_id to select without disambiguation
+# FIX: col('emp_id') was ambiguous because both current_dim and updates_df carry
+# a column named emp_id after the expression-style full_outer join. PySpark retains
+# both columns and cannot resolve the unqualified reference, raising
+# AnalysisException: [AMBIGUOUS_REFERENCE].
+#
+# Fix: use coalesce(updates_df['emp_id'], current_dim['emp_id']).alias('emp_id')
+# so that the correct emp_id is resolved for all three cases:
+#   - matched rows   : both sides non-null  -> updates_df.emp_id is returned
+#   - new inserts    : only updates_df has the key -> updates_df.emp_id is returned
+#   - deleted/stale  : only current_dim has the key -> current_dim.emp_id is returned
 final_audit = merged_stage.select(
-    col("emp_id"),
+    coalesce(updates_df["emp_id"], current_dim["emp_id"]).alias("emp_id"),
     coalesce(updates_df.emp_name, current_dim.emp_name).alias("resolved_name"),
     when(updates_df.department != current_dim.department, lit("DEPT_CHANGE"))
     .otherwise(lit("NO_CHANGE")).alias("change_type"),
