@@ -1,9 +1,8 @@
 import sys
 import logging
-from datetime import datetime
 from pyspark.context import SparkContext
 from pyspark.sql.functions import col, lit, when, max as spark_max, coalesce
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, TimestampType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -56,25 +55,39 @@ updates_df = spark.createDataFrame(incoming_data, schema=incoming_schema)
 
 logger.info("Performing reconciliation join between target dimension and source batch...")
 
-# Outer join to capture updates and new inserts
-current_dim = dim_employee_df.filter(col("is_current") == "Y")
+# Alias both DataFrames before the join so all downstream column references
+# are unambiguous regardless of which side of the full outer join is null.
+current_dim = dim_employee_df.filter(col("is_current") == "Y").alias("cur")
+updates_aliased = updates_df.alias("upd")
+
+# Full outer join using a string key so Spark deduplicates emp_id automatically.
 merged_stage = current_dim.join(
-    updates_df,
-    current_dim.emp_id == updates_df.emp_id,
-    "full_outer"
+    updates_aliased,
+    on="emp_id",
+    how="full_outer"
 )
 
 logger.info("Transforming SCD type 2 records and projecting schema...")
 
-# FAILS HERE: emp_id is present in both current_dim and updates_df
-# Spark cannot determine which table's emp_id to select without disambiguation
-final_audit = merged_stage.select(
-    col("emp_id"),
-    coalesce(updates_df.emp_name, current_dim.emp_name).alias("resolved_name"),
-    when(updates_df.department != current_dim.department, lit("DEPT_CHANGE"))
-    .otherwise(lit("NO_CHANGE")).alias("change_type"),
-    coalesce(updates_df.effective_date, current_dim.start_date).alias("record_timestamp")
-)
+try:
+    # emp_id is now a single, unambiguous column because the join was expressed
+    # as a string key.  The null-safe tri-state change_type expression handles:
+    #   - NEW_INSERT   : row exists only in updates_df  (cur.emp_id side is null)
+    #   - RECORD_CLOSED: row exists only in current_dim (upd.emp_id side is null)
+    #   - DEPT_CHANGE  : both sides present and department differs
+    #   - NO_CHANGE    : both sides present and department is the same
+    final_audit = merged_stage.select(
+        col("emp_id"),
+        coalesce(col("upd.emp_name"), col("cur.emp_name")).alias("resolved_name"),
+        when(col("cur.emp_id").isNull(), lit("NEW_INSERT"))
+        .when(col("upd.emp_id").isNull(), lit("RECORD_CLOSED"))
+        .when(col("upd.department") != col("cur.department"), lit("DEPT_CHANGE"))
+        .otherwise(lit("NO_CHANGE")).alias("change_type"),
+        coalesce(col("upd.effective_date"), col("cur.start_date")).alias("record_timestamp")
+    )
 
-final_audit.show(10, truncate=False)
-job.commit()
+    final_audit.show(10, truncate=False)
+    job.commit()
+except Exception as exc:
+    logger.error("SCD-2 transformation failed: %s", exc, exc_info=True)
+    raise
