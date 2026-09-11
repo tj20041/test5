@@ -4,6 +4,7 @@ from datetime import datetime
 from pyspark.context import SparkContext
 from pyspark.sql.functions import col, lit, when, max as spark_max, coalesce
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, TimestampType
+from pyspark.sql.utils import AnalysisException
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -56,25 +57,51 @@ updates_df = spark.createDataFrame(incoming_data, schema=incoming_schema)
 
 logger.info("Performing reconciliation join between target dimension and source batch...")
 
-# Outer join to capture updates and new inserts
-current_dim = dim_employee_df.filter(col("is_current") == "Y")
-merged_stage = current_dim.join(
-    updates_df,
-    current_dim.emp_id == updates_df.emp_id,
-    "full_outer"
-)
+try:
+    # Outer join to capture updates and new inserts
+    current_dim = dim_employee_df.filter(col("is_current") == "Y")
 
-logger.info("Transforming SCD type 2 records and projecting schema...")
+    # Defense-in-depth: proactively rename the incoming batch's join key so the
+    # subsequent full outer join never produces two columns with the same name
+    # (which is what caused the ambiguous 'emp_id' AnalysisException).
+    updates_df_renamed = updates_df.withColumnRenamed("emp_id", "upd_emp_id")
 
-# FAILS HERE: emp_id is present in both current_dim and updates_df
-# Spark cannot determine which table's emp_id to select without disambiguation
-final_audit = merged_stage.select(
-    col("emp_id"),
-    coalesce(updates_df.emp_name, current_dim.emp_name).alias("resolved_name"),
-    when(updates_df.department != current_dim.department, lit("DEPT_CHANGE"))
-    .otherwise(lit("NO_CHANGE")).alias("change_type"),
-    coalesce(updates_df.effective_date, current_dim.start_date).alias("record_timestamp")
-)
+    merged_stage = current_dim.join(
+        updates_df_renamed,
+        current_dim.emp_id == updates_df_renamed.upd_emp_id,
+        "full_outer"
+    )
 
-final_audit.show(10, truncate=False)
+    logger.info("Transforming SCD type 2 records and projecting schema...")
+
+    # FIXED: emp_id is coalesced across both sides of the full outer join so that
+    # rows originating only from the incoming batch (new hires, e.g. emp_id=104)
+    # or only from the historical dimension (dropped/expired records) both retain
+    # a non-null identifier in the final projection.
+    final_audit = merged_stage.select(
+        coalesce(current_dim.emp_id, updates_df_renamed.upd_emp_id).alias("emp_id"),
+        coalesce(updates_df_renamed.emp_name, current_dim.emp_name).alias("resolved_name"),
+        when(
+            current_dim.department.isNull() | updates_df_renamed.department.isNull(),
+            lit("NO_CHANGE")
+        ).when(
+            updates_df_renamed.department != current_dim.department,
+            lit("DEPT_CHANGE")
+        ).otherwise(lit("NO_CHANGE")).alias("change_type"),
+        coalesce(updates_df_renamed.effective_date, current_dim.start_date).alias("record_timestamp")
+    )
+
+    final_audit.show(10, truncate=False)
+
+except AnalysisException as e:
+    logger.error("AnalysisException while reconciling SCD-2 dimension data: %s", str(e))
+    logger.error("dim_employee_df schema:")
+    dim_employee_df.printSchema()
+    logger.error("updates_df schema:")
+    updates_df.printSchema()
+    raise
+except Exception as e:
+    logger.error("Unexpected error during SCD-2 reconciliation join/select: %s", str(e))
+    raise
+
 job.commit()
