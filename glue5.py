@@ -56,25 +56,34 @@ updates_df = spark.createDataFrame(incoming_data, schema=incoming_schema)
 
 logger.info("Performing reconciliation join between target dimension and source batch...")
 
-# Outer join to capture updates and new inserts
-current_dim = dim_employee_df.filter(col("is_current") == "Y")
-merged_stage = current_dim.join(
-    updates_df,
-    current_dim.emp_id == updates_df.emp_id,
-    "full_outer"
-)
+try:
+    # Alias both DataFrames before the join to avoid AMBIGUOUS_REFERENCE
+    # errors once the join plan merges overlapping column names
+    # (emp_id, department) from both sides.
+    current_dim = dim_employee_df.filter(col("is_current") == "Y").alias("cur")
+    updates_aliased = updates_df.alias("upd")
 
-logger.info("Transforming SCD type 2 records and projecting schema...")
+    # Outer join to capture updates and new inserts
+    merged_stage = current_dim.join(
+        updates_aliased,
+        col("cur.emp_id") == col("upd.emp_id"),
+        "full_outer"
+    )
 
-# FAILS HERE: emp_id is present in both current_dim and updates_df
-# Spark cannot determine which table's emp_id to select without disambiguation
-final_audit = merged_stage.select(
-    col("emp_id"),
-    coalesce(updates_df.emp_name, current_dim.emp_name).alias("resolved_name"),
-    when(updates_df.department != current_dim.department, lit("DEPT_CHANGE"))
-    .otherwise(lit("NO_CHANGE")).alias("change_type"),
-    coalesce(updates_df.effective_date, current_dim.start_date).alias("record_timestamp")
-)
+    logger.info("Transforming SCD type 2 records and projecting schema...")
 
-final_audit.show(10, truncate=False)
-job.commit()
+    # FIXED: disambiguate all overlapping columns (emp_id, department, etc.)
+    # by referencing them through their aliased DataFrame names.
+    final_audit = merged_stage.select(
+        coalesce(col("upd.emp_id"), col("cur.emp_id")).alias("emp_id"),
+        coalesce(col("upd.emp_name"), col("cur.emp_name")).alias("resolved_name"),
+        when(col("upd.department") != col("cur.department"), lit("DEPT_CHANGE"))
+        .otherwise(lit("NO_CHANGE")).alias("change_type"),
+        coalesce(col("upd.effective_date"), col("cur.start_date")).alias("record_timestamp")
+    )
+
+    final_audit.show(10, truncate=False)
+    job.commit()
+except Exception as e:
+    logger.exception("SCD-2 reconciliation job failed during join/select/commit: %s", str(e))
+    raise
